@@ -48,6 +48,13 @@ class EdgeTAMImageEncoder(torch.nn.Module):
             vision_features = backbone_fpn[2]
             high_res_feat_0 = backbone_fpn[0]
             high_res_feat_1 = backbone_fpn[1]
+
+            # Add no_mem_embed to match PyTorch EdgeTAM behavior
+            if self.model.directly_add_no_mem_embed:
+                B, C, H, W = vision_features.shape
+                vision_features_flat = vision_features.flatten(2).permute(2, 0, 1)
+                vision_features_flat = vision_features_flat + self.model.no_mem_embed.squeeze(0)
+                vision_features = vision_features_flat.permute(1, 2, 0).view(B, C, H, W)
         else:
             bs = image.shape[0]
             vision_features = torch.zeros(bs, 256, 64, 64, device=image.device)
@@ -98,9 +105,12 @@ class EdgeTAMMaskDecoder(torch.nn.Module):
         use_multimask = multimask_output[0].item() > 0.5
         high_res_features = [high_res_feat_0, high_res_feat_1]
 
+        # Use proper position encoding from prompt encoder
+        proper_image_pe = self.model.sam_prompt_encoder.get_dense_pe()
+
         sam_outputs = self.mask_decoder(
             image_embeddings=image_embeddings,
-            image_pe=image_pe,
+            image_pe=proper_image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
             dense_prompt_embeddings=dense_prompt_embeddings,
             multimask_output=use_multimask,

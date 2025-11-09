@@ -13,7 +13,7 @@ python coreml/export_to_coreml.py \
 This creates three CoreML models in `./coreml_models/`:
 - `edgetam_image_encoder.mlpackage` (9.6MB)
 - `edgetam_prompt_encoder.mlpackage` (2.0MB)
-- `edgetam_mask_decoder.mlpackage` (8.1MB)
+- `edgetam_mask_decoder.mlpackage` (9.8MB)
 
 ## Usage Example
 
@@ -44,9 +44,9 @@ Note: This is a limited test on synthetic data. Real-world performance may vary.
 
 | Metric | PyTorch | CoreML | Difference |
 |--------|---------|--------|------------|
-| Speed | 36.2ms | 34.2ms | -1.9ms |
-| Quality | IoU 0.9867 | IoU 0.9878 | +0.0011 |
-| Size | 54MB | 20MB | -34MB |
+| Speed | 40.1ms | 39.2ms | -0.9ms |
+| Quality | IoU 0.9897 | IoU 0.9893 | -0.0004 |
+| Size | 54MB | 21.4MB | -32.6MB |
 
 ## Requirements
 
@@ -54,4 +54,4 @@ Note: This is a limited test on synthetic data. Real-world performance may vary.
 - coremltools
 - EdgeTAM checkpoint
 
-The CoreML export maintains identical segmentation quality while being faster and 63% smaller for mobile deployment.
+The CoreML export maintains identical segmentation quality while being faster and 60% smaller for mobile deployment.

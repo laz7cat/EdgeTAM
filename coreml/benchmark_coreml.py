@@ -225,7 +225,7 @@ def run_benchmark():
 
     print(f"Model size comparison:")
     print(f"  PyTorch: 54MB")
-    print(f"  CoreML: 20MB (63% smaller)")
+    print(f"  CoreML: 21.4MB (60% smaller)")
 
     # Overall assessment
     print()
@@ -245,7 +245,7 @@ def run_benchmark():
     else:
         print("Performance: PyTorch faster than CoreML")
 
-    print("Size: CoreML models are 63% smaller (20MB vs 54MB)")
+    print("Size: CoreML models are 60% smaller (21.4MB vs 54MB)")
     print()
 
     return {
