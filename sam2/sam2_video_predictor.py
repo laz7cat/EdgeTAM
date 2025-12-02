@@ -43,20 +43,34 @@ class SAM2VideoPredictor(SAM2Base):
     @torch.inference_mode()
     def init_state(
         self,
-        video_path,
+        video_path=None,
+        images=None,
+        video_height=None,
+        video_width=None,
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
     ):
         """Initialize an inference state."""
         compute_device = self.device  # device of the model
-        images, video_height, video_width = load_video_frames(
-            video_path=video_path,
-            image_size=self.image_size,
-            offload_video_to_cpu=offload_video_to_cpu,
-            async_loading_frames=async_loading_frames,
-            compute_device=compute_device,
-        )
+        if video_path is not None:
+            images, video_height, video_width = load_video_frames(
+                video_path=video_path,
+                image_size=self.image_size,
+                offload_video_to_cpu=offload_video_to_cpu,
+                async_loading_frames=async_loading_frames,
+                compute_device=compute_device,
+            )
+        elif images is not None:
+            # images provided directly (e.g. for streaming)
+            # ensure it's a list for mutability (appending frames)
+            if isinstance(images, torch.Tensor):
+                images = [img for img in images]
+            if video_height is None or video_width is None:
+                 raise ValueError("video_height and video_width must be provided if images are passed directly")
+        else:
+            raise ValueError("Either video_path or images must be provided")
+
         inference_state = {}
         inference_state["images"] = images
         inference_state["num_frames"] = len(images)
@@ -109,6 +123,44 @@ class SAM2VideoPredictor(SAM2Base):
         # Warm up the visual backbone and cache the image feature on frame 0
         self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
         return inference_state
+
+    def append_frame(self, inference_state, image_tensor):
+        """Append a new frame to the inference state."""
+        inference_state["images"].append(image_tensor)
+        inference_state["num_frames"] = len(inference_state["images"])
+
+    @torch.inference_mode()
+    def track_new_frame(self, inference_state, frame_idx):
+        """Run tracking on a newly added frame (assuming previous frames are processed)."""
+        if not inference_state["tracking_has_started"]:
+             self.propagate_in_video_preflight(inference_state)
+        
+        output_dict = inference_state["output_dict"]
+        storage_key = "non_cond_frame_outputs"
+        batch_size = self._get_obj_num(inference_state)
+        
+        current_out, pred_masks = self._run_single_frame_inference(
+            inference_state=inference_state,
+            output_dict=output_dict,
+            frame_idx=frame_idx,
+            batch_size=batch_size,
+            is_init_cond_frame=False,
+            point_inputs=None,
+            mask_inputs=None,
+            reverse=False,
+            run_mem_encoder=True,
+        )
+        output_dict[storage_key][frame_idx] = current_out
+        self._add_output_per_object(
+            inference_state, frame_idx, current_out, storage_key
+        )
+        inference_state["frames_already_tracked"][frame_idx] = {"reverse": False}
+        
+        # Resize the output mask to the original video resolution
+        _, video_res_masks = self._get_orig_video_res_output(
+            inference_state, pred_masks
+        )
+        return video_res_masks
 
     @classmethod
     def from_pretrained(cls, model_id: str, **kwargs) -> "SAM2VideoPredictor":

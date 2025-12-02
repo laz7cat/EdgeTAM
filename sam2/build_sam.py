@@ -158,14 +158,67 @@ def build_sam2_video_predictor_hf(model_id, **kwargs):
     )
 
 
+# def _load_checkpoint(model, ckpt_path):
+#     if ckpt_path is not None:
+#         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)["model"]
+#         missing_keys, unexpected_keys = model.load_state_dict(sd)
+#         if missing_keys:
+#             logging.error(missing_keys)
+#             raise RuntimeError()
+#         if unexpected_keys:
+#             logging.error(unexpected_keys)
+#             raise RuntimeError()
+#         logging.info("Loaded checkpoint sucessfully")
+
+# 改参数：num_maskmem
 def _load_checkpoint(model, ckpt_path):
     if ckpt_path is not None:
-        sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)["model"]
-        missing_keys, unexpected_keys = model.load_state_dict(sd)
+        # 1. 加载权重字典
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)["model"]
+
+        # 2. 适配 maskmem_tpos_enc (支持由大变小，也支持由小变大)
+        for key in list(state_dict.keys()):
+            if "maskmem_tpos_enc" in key:
+                loaded_tensor = state_dict[key]
+                # print(loaded_tensor.shape)
+                # print(loaded_tensor)
+
+                if hasattr(model, "maskmem_tpos_enc"):
+                    target_shape = model.maskmem_tpos_enc.shape
+                    current_shape = loaded_tensor.shape
+
+                    # 情况 A: 权重比模型大 (7 -> 2) -> 裁剪
+                    if current_shape[0] > target_shape[0]:
+                        print(f"Auto-Slicing '{key}': {current_shape} -> {target_shape}")
+                        state_dict[key] = loaded_tensor[:target_shape[0], :, :, :]
+
+                    # 情况 B: 权重比模型小 (7 -> 10) -> 填充 (Extrapolation)
+                    elif current_shape[0] < target_shape[0]:
+                        print(f"Auto-Padding '{key}': {current_shape} -> {target_shape}")
+
+                        # 创建一个新的空张量，形状为目标大小
+                        new_tensor = torch.zeros(target_shape, dtype=loaded_tensor.dtype, device=loaded_tensor.device)
+
+                        # 1. 先把原来训练好的前 7 个原封不动拷进去
+                        valid_len = current_shape[0]
+                        new_tensor[:valid_len] = loaded_tensor
+
+                        # 2. 填充多出来的部分
+                        # 策略：复制最后一个有效的编码 (第 7 个)。
+                        # 假设：更久远的记忆的时间属性与最后那个记忆相似。
+                        last_valid_embedding = loaded_tensor[valid_len - 1]
+                        # last_valid_embedding = loaded_tensor[1]
+                        for i in range(valid_len, target_shape[0]):
+                            new_tensor[i] = last_valid_embedding
+
+                        state_dict[key] = new_tensor
+
+        # 3. 加载
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
         if missing_keys:
-            logging.error(missing_keys)
-            raise RuntimeError()
+            logging.error(f"Missing keys: {missing_keys}")
         if unexpected_keys:
-            logging.error(unexpected_keys)
-            raise RuntimeError()
-        logging.info("Loaded checkpoint sucessfully")
+            logging.error(f"Unexpected keys: {unexpected_keys}")
+
+        logging.info("Loaded checkpoint successfully with auto-adaptation")
