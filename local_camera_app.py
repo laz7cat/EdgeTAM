@@ -359,7 +359,7 @@ def main():
             prev_time = curr_time
             
             cv2.putText(display_frame, f"FPS: {int(soft_fps)}", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             
             # --- 5. Window Resizing & Letterboxing ---
             try:
