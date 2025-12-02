@@ -342,19 +342,24 @@ async def index():
                 if (pc) pc.close();
                 pc = new RTCPeerConnection(config);
 
+                // Explicitly add a transceiver to ensure m-line is generated
+                pc.addTransceiver('video', {direction: 'recvonly'});
+
                 pc.addEventListener('track', function(evt) {
                     if (evt.track.kind == 'video') {
                         document.getElementById('video').srcObject = evt.streams[0];
                     }
                 });
 
-                var offer = await pc.createOffer({ offerToReceiveVideo: true });
+                var offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
 
                 // Quick timeout for ICE
                 await new Promise(r => setTimeout(r, 500));
                 
-                var response = await fetch('/offer', {
+                var baseUrl = window.location.origin; // Get current host and port
+                
+                var response = await fetch(baseUrl + '/offer', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -362,32 +367,42 @@ async def index():
                         type: pc.localDescription.type
                     })
                 });
+                
+                if (!response.ok) {
+                    throw new Error("Server responded with " + response.status);
+                }
 
                 var answer = await response.json();
                 await pc.setRemoteDescription(answer);
             }
 
             async function reset() {
-                await fetch('/reset', { method: 'POST' });
+                var baseUrl = window.location.origin;
+                await fetch(baseUrl + '/reset', { method: 'POST' });
             }
 
             // Click Handler
             document.getElementById('video').addEventListener('mousedown', async function(e) {
                 var rect = e.target.getBoundingClientRect();
-                // Assuming fixed 1280x720 source
                 var videoW = 1280;
                 var videoH = 720;
                 
+                if (e.target.naturalWidth > 0) {
+                    videoW = e.target.naturalWidth;
+                    videoH = e.target.naturalHeight;
+                }
+
                 var scaleX = videoW / rect.width;
                 var scaleY = videoH / rect.height;
                 
                 var x = (e.clientX - rect.left) * scaleX;
                 var y = (e.clientY - rect.top) * scaleY;
                 
-                await fetch('/click', {
+                var baseUrl = window.location.origin;
+                await fetch(baseUrl + '/click', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ x: x, y: y, label: 1 }) // Always include (left click)
+                    body: JSON.stringify({ x: x, y: y, label: 1 })
                 });
             });
         </script>
@@ -398,6 +413,11 @@ async def index():
 @app.post("/offer")
 async def offer(request: Request):
     params = await request.json()
+    # Debug: Print received SDP to analyze direction issues
+    print("--- Received SDP Offer ---")
+    print(params["sdp"])
+    print("--------------------------")
+    
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     pc = RTCPeerConnection()
@@ -412,7 +432,10 @@ async def offer(request: Request):
     global active_track
     video = EdgeTAMTrack()
     active_track = video # Save reference for interaction
-    pc.addTrack(video)
+    
+    # Explicitly add transceiver to avoid direction negotiation issues
+    pc.addTransceiver(video, direction="sendonly")
+    # pc.addTrack(video) # addTransceiver adds the track implicitly
 
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
