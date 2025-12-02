@@ -130,7 +130,7 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["num_frames"] = len(inference_state["images"])
 
     @torch.inference_mode()
-    def track_new_frame(self, inference_state, frame_idx):
+    def track_new_frame(self, inference_state, frame_idx, max_history=15):
         """Run tracking on a newly added frame (assuming previous frames are processed)."""
         if not inference_state["tracking_has_started"]:
              self.propagate_in_video_preflight(inference_state)
@@ -156,6 +156,31 @@ class SAM2VideoPredictor(SAM2Base):
         )
         inference_state["frames_already_tracked"][frame_idx] = {"reverse": False}
         
+        # --- Memory Cleanup (Sliding Window) ---
+        # Prune old frames to prevent memory explosion in infinite streaming
+        if frame_idx > max_history:
+            old_frame_idx = frame_idx - max_history
+            
+            # Important: Never delete Conditioning Frames (User interactions)
+            # We only delete frames that were purely inferred results
+            is_cond_frame = old_frame_idx in inference_state["consolidated_frame_inds"]["cond_frame_outputs"]
+            
+            if not is_cond_frame:
+                # 1. Free raw image memory (RAM)
+                # We keep the list slot but set it to None to release the Tensor
+                if old_frame_idx < len(inference_state["images"]):
+                    inference_state["images"][old_frame_idx] = None
+                
+                # 2. Free cached features (VRAM)
+                inference_state["cached_features"].pop(old_frame_idx, None)
+                
+                # 3. Free output masks/logits (VRAM)
+                output_dict["non_cond_frame_outputs"].pop(old_frame_idx, None)
+                
+                # 4. Free per-object slices
+                for obj_output_dict in inference_state["output_dict_per_obj"].values():
+                    obj_output_dict["non_cond_frame_outputs"].pop(old_frame_idx, None)
+
         # Resize the output mask to the original video resolution
         _, video_res_masks = self._get_orig_video_res_output(
             inference_state, pred_masks
