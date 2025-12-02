@@ -6,6 +6,8 @@ import os
 import time
 import cv2
 import uvicorn
+import threading
+import queue
 from fractions import Fraction
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 from av import VideoFrame
@@ -21,37 +23,65 @@ class CameraTrack(MediaStreamTrack):
 
     def __init__(self):
         super().__init__()
-        self.cap = cv2.VideoCapture(0)
+        # Use a queue to decouple capture from sending
+        # maxsize=1 ensures we always work on the freshest frame and drop old ones if processing is slow
+        self.frame_queue = queue.Queue(maxsize=10)
+        self.stop_event = threading.Event()
         
-        if not self.cap.isOpened():
-            logger.error("CRITICAL: Could not open camera (index 0). Check if it's used by another app.")
-        else:
-            logger.info(f"Camera opened successfully. Backend: {self.cap.getBackendName()}")
-            
-        # self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
         self.start_time = time.time()
         self.frame_count = 0
+        
+        # Start capture thread
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread.start()
+
+    def _capture_loop(self):
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) # Try DirectShow for better FPS on Windows
+        if not cap.isOpened():
+            # Fallback
+            cap = cv2.VideoCapture(0)
+            
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        if not cap.isOpened():
+            logger.error("CRITICAL: Could not open camera.")
+            return
+
+        logger.info(f"Camera opened. Backend: {cap.getBackendName()}")
+
+        while not self.stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                continue
+                
+            # Put in queue. If full, remove old item first (drop frame strategy)
+            if self.frame_queue.full():
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            
+            self.frame_queue.put(frame)
+            
+        cap.release()
 
     async def recv(self):
-        # Manually calculate PTS to avoid AttributeError with next_timestamp
-        # Video time base is typically 1/90000
+        # Manual PTS
         pts = int(time.time() * 90000)
         time_base = Fraction(1, 90000)
         
-        ret, frame = self.cap.read()
-        if not ret:
-            logger.warning("Failed to read frame from camera")
-            # Return black frame on failure
+        # Get frame from queue (non-blocking or minimal blocking)
+        # Run in executor to avoid blocking event loop if queue is empty
+        loop = asyncio.get_event_loop()
+        try:
+            # This might block slightly if queue empty, but thread is filling it fast
+            # Using executor makes it truly async-friendly
+            frame = await loop.run_in_executor(None, self.frame_queue.get)
+        except Exception:
             frame = np.zeros((720, 1280, 3), dtype='uint8')
-        else:
-            # Log every 60 frames to confirm flow without spamming
-            if self.frame_count % 60 == 0:
-                logger.info(f"Frame {self.frame_count} captured and processing")
-        
+
         # Calculate FPS
         self.frame_count += 1
         elapsed = time.time() - self.start_time
@@ -73,7 +103,10 @@ class CameraTrack(MediaStreamTrack):
         return new_frame
 
     def stop(self):
-        self.cap.release()
+        self.stop_event.set()
+        if self.capture_thread.is_alive():
+            self.capture_thread.join(timeout=1.0)
+        super().stop()
 
 app = FastAPI()
 pcs = set()
@@ -86,7 +119,7 @@ async def index():
         <title>Simple WebRTC</title>
     </head>
     <body>
-        <h1>Simple WebRTC Stream</h1>
+        <h1>Simple WebRTC Stream (Threaded)</h1>
         <video id="video" autoplay playsinline muted style="width: 1280px; border: 1px solid black;"></video>
         <br>
         <button onclick="start()">Start</button>
@@ -102,13 +135,11 @@ async def index():
             async function start() {
                 var config = {
                     sdpSemantics: 'unified-plan',
-                    // STUN server is critical
                     iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }]
                 };
 
                 pc = new RTCPeerConnection(config);
 
-                // Handle incoming video track
                 pc.addEventListener('track', function(evt) {
                     if (evt.track.kind == 'video') {
                         document.getElementById('video').srcObject = evt.streams[0];
@@ -120,20 +151,13 @@ async def index():
                     log("ICE State: " + pc.iceConnectionState);
                 });
 
-                // Create Offer
                 var offer = await pc.createOffer({ offerToReceiveVideo: true });
                 await pc.setLocalDescription(offer);
 
                 log("Local description set. Gathering candidates...");
-
-                // OPTIMIZATION: Don't wait indefinitely for ICE complete.
-                // Wait for a short time (e.g., 500ms) or proceed immediately.
-                // aiortc often works without full trickle ICE support in simple examples.
                 await new Promise(r => setTimeout(r, 1000));
-
                 log("Sending offer...");
                 
-                // Send to server
                 try {
                     var response = await fetch('/offer', {
                         method: 'POST',
@@ -175,7 +199,6 @@ async def offer(request: Request):
             await pc.close()
             pcs.discard(pc)
 
-    # Add camera track
     video = CameraTrack()
     pc.addTrack(video)
 
@@ -190,10 +213,10 @@ async def offer(request: Request):
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # Close peer connections
     coros = [pc.close() for pc in pcs]
     await asyncio.gather(*coros)
     pcs.clear()
 
 if __name__ == "__main__":
+    # Use 0.0.0.0 to bind all interfaces
     uvicorn.run(app, host="0.0.0.0", port=7860)
