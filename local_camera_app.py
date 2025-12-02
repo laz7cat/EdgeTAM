@@ -144,6 +144,9 @@ def determine_target_obj_id(click_x, click_y, last_masks):
 def mouse_callback(event, x, y, flags, param):
     global click_queue, display_params
     
+    actual_frame_width = param["actual_w"]
+    actual_frame_height = param["actual_h"]
+    
     if event == cv2.EVENT_LBUTTONDOWN or event == cv2.EVENT_RBUTTONDOWN:
         scale = display_params["scale"]
         pad_x = display_params["pad_x"]
@@ -158,8 +161,8 @@ def mouse_callback(event, x, y, flags, param):
         else:
             orig_x, orig_y = 0, 0
         
-        orig_x = max(0, min(orig_x, 1280 - 1))
-        orig_y = max(0, min(orig_y, 720 - 1))
+        orig_x = max(0, min(orig_x, actual_frame_width - 1))
+        orig_y = max(0, min(orig_y, actual_frame_height - 1))
 
         if event == cv2.EVENT_LBUTTONDOWN:
             click_queue.append((orig_x, orig_y, 1))
@@ -175,9 +178,12 @@ def main():
         return
 
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # cap.set(cv2.CAP_PROP_FPS, 30)
+    # cap.set(cv2.CAP_PROP_FPS, 60)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -188,7 +194,7 @@ def main():
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, 960, 540)
     cv2.moveWindow(WINDOW_NAME, 100, 100)
-    cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
+    cv2.setMouseCallback(WINDOW_NAME, mouse_callback, param={"actual_w": actual_w, "actual_h": actual_h})
 
     print("\n--- Instructions ---")
     print("Left Click (Background): Start Tracking New Object")
@@ -218,6 +224,7 @@ def main():
                 break
 
             frame_h, frame_w = frame.shape[:2]
+            print(f"Processing Frame: {frame_w}x{frame_h}")
             
             new_clicks_triggered_reinit = False 
             
