@@ -2,9 +2,10 @@ import os
 import sys
 import cv2
 import torch
+import torch.nn.functional as F
 import numpy as np
 import time
-import random # Not strictly used now, but good to have if we randomize colors more
+import random
 
 # Ensure we can import sam2 from current directory
 sys.path.append(os.getcwd())
@@ -34,9 +35,6 @@ IMAGE_SIZE = predictor.image_size # Model's internal image size (e.g., 1024)
 print("Model loaded successfully.")
 
 # --- Constants ---
-# ImageNet Mean/Std for model normalization
-IMG_MEAN = np.array([0.485, 0.456, 0.406])
-IMG_STD = np.array([0.229, 0.224, 0.225])
 WINDOW_NAME = 'EdgeTAM Multi-Object Tracker'
 
 # Colors for different objects (RGB format for drawing)
@@ -65,22 +63,32 @@ last_masks_cache = {}       # Last known masks for hit-testing clicks: { obj_id:
 display_params = {"scale": 1.0, "pad_x": 0, "pad_y": 0} # For coordinate mapping (window to original frame)
 
 # --- Helper Functions ---
-def preprocess_frame(image_np):
+def preprocess_frame_gpu(image_np, device, mean, std):
     """
-    Preprocess a raw numpy image frame for the EdgeTAM model.
-    Resizes to model's IMAGE_SIZE, normalizes pixel values, and converts to a PyTorch tensor.
+    Preprocess a raw numpy image frame on GPU for the EdgeTAM model.
+    1. Uploads raw uint8 image to GPU.
+    2. Resizes to IMAGE_SIZE using interpolation on GPU.
+    3. Normalizes pixel values.
     """
-    img_resized = cv2.resize(image_np, (IMAGE_SIZE, IMAGE_SIZE))
-    img_float = img_resized.astype(np.float32) / 255.0
-    img_float = (img_float - IMG_MEAN) / IMG_STD
-    img_tensor = torch.from_numpy(img_float).permute(2, 0, 1).float()
+    # 1. Upload to GPU: (H, W, C) -> (C, H, W)
+    # We keep it as uint8 during transfer to save bandwidth, then convert to float on GPU
+    img_tensor = torch.from_numpy(image_np).to(device, non_blocking=True).permute(2, 0, 1).float()
+    
+    # 2. Resize to model input size (1024x1024)
+    # interpolate expects (N, C, H, W), so we unsqueeze and then squeeze back
+    img_tensor = img_tensor.unsqueeze(0)
+    img_tensor = F.interpolate(img_tensor, size=(IMAGE_SIZE, IMAGE_SIZE), mode='bilinear', align_corners=False)
+    img_tensor = img_tensor.squeeze(0)
+    
+    # 3. Normalize (0-255 -> 0-1) and apply ImageNet mean/std
+    img_tensor = img_tensor / 255.0
+    img_tensor = (img_tensor - mean) / std
+    
     return img_tensor
 
 def get_mask_overlay(image, masks_tensor, obj_ids, alpha=0.5):
     """
     Overlays multiple binary masks (from masks_tensor) onto the original image.
-    Each mask is drawn with a unique color based on its obj_id, with a slight alpha blend
-    and a visible contour.
     """
     if isinstance(masks_tensor, torch.Tensor):
         masks_np = masks_tensor.cpu().numpy()
@@ -94,25 +102,24 @@ def get_mask_overlay(image, masks_tensor, obj_ids, alpha=0.5):
     
     # Iterate through masks (obj_ids)
     for i, obj_id in enumerate(obj_ids):
-        # Safety check if obj_ids might have more entries than masks_np
         if i >= len(masks_np):
             continue
         
         mask = masks_np[i]
-        if mask.ndim == 3: # Mask might be (1, H, W), so squeeze to (H, W)
+        if mask.ndim == 3:
             mask = mask.squeeze()
         
-        mask_bool = mask > 0 # Convert float mask to boolean
-        if not mask_bool.any(): # Skip if mask is entirely empty
+        mask_bool = mask > 0
+        if not mask_bool.any():
             continue
             
-        color = COLORS[obj_id % len(COLORS)] # Pick color based on object ID
+        color = COLORS[obj_id % len(COLORS)]
         
-        # Draw Contour for better visibility
+        # Draw Contour
         contours, _ = cv2.findContours(mask_bool.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay, contours, -1, color, 2) # Draw 2-pixel thick contour
+        cv2.drawContours(overlay, contours, -1, color, 2)
 
-        # Fill mask area with alpha blending
+        # Fill mask area
         colored_roi = np.zeros_like(overlay)
         colored_roi[mask_bool] = color
         overlay[mask_bool] = cv2.addWeighted(image[mask_bool], 1 - alpha, colored_roi[mask_bool], alpha, 0)
@@ -120,98 +127,68 @@ def get_mask_overlay(image, masks_tensor, obj_ids, alpha=0.5):
     return overlay
 
 def determine_target_obj_id(click_x, click_y, last_masks):
-    """
-    Determine if a click falls within an existing object's mask.
-    Returns the obj_id if a hit is detected, otherwise None.
-    """
     if not last_masks:
         return None
 
-    # Iterate through masks in reverse order (to hit topmost drawn object if overlapping)
     for obj_id in sorted(last_masks.keys(), reverse=True):
-        mask = last_masks[obj_id] # mask is already a numpy 2d array from cache
+        mask = last_masks[obj_id]
         h, w = mask.shape
         cx, cy = int(click_x), int(click_y)
         
-        # Check bounds before accessing mask[cy, cx]
         if 0 <= cx < w and 0 <= cy < h:
-            if mask[cy, cx] > 0: # If pixel in mask is foreground
+            if mask[cy, cx] > 0:
                 return obj_id
     
-    return None # No object mask hit
+    return None
 
 def mouse_callback(event, x, y, flags, param):
-    """
-    OpenCV mouse callback function to handle click events.
-    Maps window coordinates to original frame coordinates and queues clicks.
-    """
     global click_queue, display_params
     
-    # Only process Left or Right mouse button clicks
     if event == cv2.EVENT_LBUTTONDOWN or event == cv2.EVENT_RBUTTONDOWN:
         scale = display_params["scale"]
         pad_x = display_params["pad_x"]
         pad_y = display_params["pad_y"]
         
-        # Transform window coordinates to coordinates on the displayed image portion
         img_x = x - pad_x
         img_y = y - pad_y
         
-        # Scale back to original frame resolution
-        if scale > 0: # Avoid division by zero
+        if scale > 0:
             orig_x = int(img_x / scale)
             orig_y = int(img_y / scale)
-        else: # Fallback if scale is zero (e.g. window minimized)
+        else:
             orig_x, orig_y = 0, 0
         
-        # Clamp coordinates to original frame dimensions (1280x720)
-        # These are max dimensions, actual frame might be smaller if camera couldn't set 1280x720
-        # The model's init_state takes actual frame_h, frame_w which is used for normalization
-        # So clamping to 1280x720 is a reasonable default.
         orig_x = max(0, min(orig_x, 1280 - 1))
         orig_y = max(0, min(orig_y, 720 - 1))
 
         if event == cv2.EVENT_LBUTTONDOWN:
-            click_queue.append((orig_x, orig_y, 1)) # Label 1 for Include
-            # print(f"Click Left: Original({orig_x}, {orig_y})") # Debug print can be noisy
+            click_queue.append((orig_x, orig_y, 1))
         elif event == cv2.EVENT_RBUTTONDOWN:
-            click_queue.append((orig_x, orig_y, 0)) # Label 0 for Exclude
-            # print(f"Click Right: ({orig_x}, {orig_y})") # Debug print can be noisy
+            click_queue.append((orig_x, orig_y, 0))
 
 def main():
     global inference_state, is_tracking, frame_idx, click_queue, display_params, active_objects, last_masks_cache
     
-    cap = cv2.VideoCapture(0) # Open default camera
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("Error: Could not open webcam. Please check if it's connected or used by another application.")
+        print("Error: Could not open webcam.")
         return
 
-    # --- Camera Optimization Setup (1280x720 @ 30fps MJPG) ---
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    # Verify camera settings
     actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    actual_fps_prop = cap.get(cv2.CAP_PROP_FPS) # Get property FPS
-    fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
-    try:
-        fourcc_str = "".join([chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)])
-    except Exception:
-        fourcc_str = "Unknown" # In case FourCC is invalid
+    actual_fps_prop = cap.get(cv2.CAP_PROP_FPS)
+    print(f"Camera Settings: {int(actual_w)}x{int(actual_h)} @ {actual_fps_prop} FPS")
 
-    print(f"Camera Settings: {int(actual_w)}x{int(actual_h)} @ {actual_fps_prop} FPS (Format: {fourcc_str})")
-    if int(actual_w) != 1280 or int(actual_h) != 720 or actual_fps_prop < 29:
-        print("Warning: Could not set desired camera settings (1280x720 @ 30 FPS).")
-
-    # --- Window Setup ---
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL) # Enable Resizable Window
-    cv2.resizeWindow(WINDOW_NAME, 960, 540) # Default size (75% of 720p)
-    cv2.moveWindow(WINDOW_NAME, 100, 100) # Force to visible position
-    cv2.setMouseCallback(WINDOW_NAME, mouse_callback) # Register mouse interaction
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, 960, 540)
+    cv2.moveWindow(WINDOW_NAME, 100, 100)
+    cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
 
     print("\n--- Instructions ---")
     print("Left Click (Background): Start Tracking New Object")
@@ -221,92 +198,94 @@ def main():
     print("Q Key: Quit")
     print("-----------------------\n")
 
-    # --- Autocast Context for Inference ---
+    # Prepare GPU constants for preprocessing
+    # ImageNet Mean/Std: [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    gpu_mean = torch.tensor([0.485, 0.456, 0.406], device=DEVICE).view(3, 1, 1)
+    gpu_std = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(3, 1, 1)
+
     if DEVICE == "cuda":
         autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     else:
-        autocast_ctx = torch.no_grad() # Use no_grad as a fallback for non-CUDA
+        autocast_ctx = torch.no_grad()
 
-    prev_time = 0 # For FPS calculation (software FPS)
+    prev_time = 0
 
     with autocast_ctx:
         while True:
-            # --- 1. Read Frame ---
             ret, frame = cap.read()
             if not ret:
-                print("Error: Failed to read frame from camera. Exiting.")
+                print("Error: Failed to read frame.")
                 break
 
-            frame_h, frame_w = frame.shape[:2] # Original frame dimensions
+            frame_h, frame_w = frame.shape[:2]
             
-            # --- 2. Process Mouse Clicks & Update Object Registry ---
-            # A flag to trigger re-initialization if any clicks modify active_objects
             new_clicks_triggered_reinit = False 
             
-            if click_queue: # If there are pending mouse clicks
+            if click_queue:
                 while click_queue:
-                    cx, cy, clabel = click_queue.pop(0) # Get next click
+                    cx, cy, clabel = click_queue.pop(0)
                     is_include = (clabel == 1)
                     
-                    # Determine which object this click belongs to
                     target_obj_id = determine_target_obj_id(cx, cy, last_masks_cache)
                     
-                    if target_obj_id is None: # Clicked on background
-                        if is_include: # Left click on background -> New Object
-                            if active_objects: # Get next available object ID
+                    if target_obj_id is None:
+                        if is_include:
+                            if active_objects:
                                 target_obj_id = max(active_objects.keys()) + 1
-                            else: # First ever object starts with ID 0
+                            else:
                                 target_obj_id = 0
                             print(f"-> Creating NEW Object ID: {target_obj_id} at ({cx}, {cy})")
-                            active_objects[target_obj_id] = {'points': [], 'labels': []} # Initialize prompts for new object
-                        else: # Right click on background -> Ignore
-                            print("-> Ignored Right Click on background (cannot start new object with exclude).")
-                            continue # Skip this click, doesn't modify registry
-                    else: # Clicked on an existing object
+                            active_objects[target_obj_id] = {'points': [], 'labels': []}
+                        else:
+                            print("-> Ignored Right Click on background.")
+                            continue
+                    else:
                         print(f"-> Refining Object ID: {target_obj_id} at ({cx}, {cy})")
 
-                    # Add point to the determined target object's prompt history
                     active_objects[target_obj_id]['points'].append([cx, cy])
                     active_objects[target_obj_id]['labels'].append(clabel)
-                    new_clicks_triggered_reinit = True # A click always forces re-initialization
+                    new_clicks_triggered_reinit = True
 
-            # --- 3. Inference Logic ---
+            # --- Inference Logic ---
             current_display_masks_tensor = None
             current_display_obj_ids = []
             
-            # Preprocess current frame for the model
-            frame_tensor = preprocess_frame(frame).to(DEVICE)
+            # OPTIMIZATION: Only preprocess if we are tracking or initializing
+            # And perform preprocessing on GPU
+            frame_tensor = None
+            if is_tracking or new_clicks_triggered_reinit:
+                frame_tensor = preprocess_frame_gpu(frame, DEVICE, gpu_mean, gpu_std)
 
             if new_clicks_triggered_reinit or (is_tracking == False and active_objects):
-                # Scenario A: Re-initialize tracking if new clicks occurred OR if tracking is not active but there are objects in registry (first start)
-                if not active_objects: # If no objects after processing clicks (e.g., only ignored clicks)
-                    is_tracking = False # Ensure tracking is off
-                    inference_state = None # Clear model state
-                    last_masks_cache = {} # Clear cache
-                    print("No active objects to track. Waiting for input.")
+                if not active_objects:
+                    is_tracking = False
+                    inference_state = None
+                    last_masks_cache = {}
+                    print("No active objects to track.")
                 else:
                     print(f"Re-initializing tracker with {len(active_objects)} objects...")
-                    inference_state = predictor.init_state( # Re-initialize model state
-                        images=[frame_tensor], # Current frame is treated as Frame 0 for this new session
+                    # Note: init_state might re-read frame info, so we pass current frame props
+                    # However, EdgeTAM's init_state with images list expects just the tensors.
+                    # The frame_h/w are for coordinate normalization inside the model.
+                    inference_state = predictor.init_state(
+                        images=[frame_tensor],
                         video_height=frame_h,
                         video_width=frame_w
                     )
                     is_tracking = True
-                    frame_idx = 0 # Reset frame counter for new tracking session
+                    frame_idx = 0
                     
                     temp_masks_list = []
                     temp_ids_list = []
                     
-                    # Apply ALL accumulated prompt points for ALL active objects
                     for obj_id in sorted(active_objects.keys()):
                         data = active_objects[obj_id]
                         pts = np.array(data['points'], dtype=np.float32)
                         lbls = np.array(data['labels'], dtype=np.int32)
                         
-                        # Call add_new_points for each object ID for Frame 0 of this new session
                         _, _, out_masks_for_obj = predictor.add_new_points_or_box(
                             inference_state=inference_state,
-                            frame_idx=0, # Apply points to the first frame of this new session
+                            frame_idx=0,
                             obj_id=obj_id,
                             points=pts,
                             labels=lbls,
@@ -315,42 +294,37 @@ def main():
                         temp_ids_list.append(obj_id)
                     
                     if temp_masks_list:
-                        current_display_masks_tensor = torch.cat(temp_masks_list, dim=0) # Concatenate all (N_obj, 1, H, W)
+                        current_display_masks_tensor = torch.cat(temp_masks_list, dim=0)
                         current_display_obj_ids = temp_ids_list
                         
-                        # Update cache for next click's hit-testing
                         last_masks_cache = {}
                         masks_np = current_display_masks_tensor.cpu().numpy()
                         for i, oid in enumerate(current_display_obj_ids):
-                            if i < len(masks_np): # Safety check
+                            if i < len(masks_np):
                                 last_masks_cache[oid] = masks_np[i].squeeze()
 
             elif is_tracking and active_objects:
-                # Scenario B: Continue normal tracking (no re-init needed, just propagate)
-                predictor.append_frame(inference_state, frame_tensor) # Add current frame to model's sequence
-                frame_idx += 1 # Increment frame counter
+                predictor.append_frame(inference_state, frame_tensor)
+                frame_idx += 1
                 
-                # Standard tracking step: Get masks for all currently tracked objects
                 out_masks_from_track = predictor.track_new_frame(inference_state, frame_idx)
                 
                 current_display_masks_tensor = out_masks_from_track
-                current_display_obj_ids = inference_state["obj_ids"] # Get object IDs from predictor's state
+                current_display_obj_ids = inference_state["obj_ids"]
                 
-                # Update cache for next click's hit-testing
                 last_masks_cache = {}
                 if current_display_masks_tensor is not None:
                     masks_np = current_display_masks_tensor.cpu().numpy()
                     for i, oid in enumerate(current_display_obj_ids):
-                        if i < len(masks_np): # Safety check
+                        if i < len(masks_np):
                             last_masks_cache[oid] = masks_np[i].squeeze()
 
-            # --- 4. Draw & Display ---
-            display_frame = frame.copy() # Start with a clean copy of the original frame
+            # --- Draw & Display ---
+            display_frame = frame.copy()
             
             if current_display_masks_tensor is not None and len(current_display_obj_ids) > 0:
                 display_frame = get_mask_overlay(display_frame, current_display_masks_tensor, current_display_obj_ids)
 
-            # Draw FPS
             curr_time = time.time()
             soft_fps = 0
             if prev_time != 0:
@@ -361,12 +335,12 @@ def main():
             cv2.putText(display_frame, f"FPS: {int(soft_fps)}", (10, 30), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             
-            # --- 5. Window Resizing & Letterboxing ---
+            # Window Resizing
             try:
                 win_rect = cv2.getWindowImageRect(WINDOW_NAME)
                 win_w, win_h = win_rect[2], win_rect[3]
             except Exception:
-                win_w, win_h = 960, 540 # Fallback default size
+                win_w, win_h = 960, 540
             
             if win_w > 0 and win_h > 0:
                 img_h, img_w = display_frame.shape[:2]
@@ -374,18 +348,17 @@ def main():
                 win_aspect = win_w / win_h
                 
                 new_w, new_h, pad_x, pad_y = 0, 0, 0, 0
-                if win_aspect > aspect_ratio: # Window is wider than image aspect ratio
+                if win_aspect > aspect_ratio:
                     new_h = win_h
                     new_w = int(win_h * aspect_ratio)
                     pad_x = (win_w - new_w) // 2
-                else: # Window is taller than image aspect ratio
+                else:
                     new_w = win_w
                     new_h = int(win_w / aspect_ratio)
                     pad_y = (win_h - new_h) // 2
                 
                 new_w = max(1, new_w); new_h = max(1, new_h)
 
-                # Store params for mouse callback to translate coordinates
                 display_params["scale"] = new_w / img_w
                 display_params["pad_x"] = pad_x
                 display_params["pad_y"] = pad_y
@@ -395,10 +368,9 @@ def main():
                 canvas[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized_display_frame
                 
                 cv2.imshow(WINDOW_NAME, canvas)
-            else: # If window is minimized or invalid, just show frame without resizing
+            else:
                 cv2.imshow(WINDOW_NAME, display_frame)
 
-            # --- 6. Input Handling (Keyboard) ---
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
@@ -408,8 +380,8 @@ def main():
                 inference_state = None
                 frame_idx = 0
                 click_queue = []
-                active_objects = {} # Clear all object prompts
-                last_masks_cache = {} # Clear mask cache
+                active_objects = {}
+                last_masks_cache = {}
 
     cap.release()
     cv2.destroyAllWindows()
