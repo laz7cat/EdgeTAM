@@ -433,3 +433,65 @@ class RoPEAttentionv2(Attention):
         out = self.out_proj(out)
 
         return out
+
+    # def forward(
+    #     self,
+    #     q: Tensor,
+    #     k: Tensor,
+    #     v: Tensor,
+    #     num_k_exclude_rope: int = 0,
+    #     rope_k_repeat: int = -1,
+    # ) -> Tensor:
+    #     # Input projections
+    #     q = self.q_proj(q)
+    #     k = self.k_proj(k)
+    #     v = self.v_proj(v)
+
+    #     # Separate into heads
+    #     q = self._separate_heads(q, self.num_heads)
+    #     k = self._separate_heads(k, self.num_heads)
+    #     v = self._separate_heads(v, self.num_heads)
+
+    #     # --- Dynamic Frequency Update ---
+    #     # Check if input resolution has changed (e.g. 448px -> 784 tokens vs 1024px -> 4096 tokens)
+    #     w = h = int(math.sqrt(q.shape[-2]))
+        
+    #     # Recompute Q frequencies if mismatch
+    #     if self.freqs_cis_q.shape[0] != q.shape[-2]:
+    #         self.freqs_cis_q = self.compute_cis(end_x=w, end_y=h).to(q.device)
+            
+    #     # Recompute K frequencies if mismatch (assuming K spatial dim matches Q)
+    #     if self.freqs_cis_k.shape[0] != q.shape[-2]:
+    #         self.freqs_cis_k = self.compute_cis(end_x=w, end_y=h).to(q.device)
+    #     # -------------------------------
+
+    #     # Apply rotary position encoding
+    #     self.freqs_cis_q = self.freqs_cis_q.to(q.device)
+    #     self.freqs_cis_k = self.freqs_cis_k.to(q.device)
+    #     q = apply_rotary_enc_v2(q, self.freqs_cis_q, repeat_freqs=1)
+    #     num_k_rope = k.size(-2) - num_k_exclude_rope
+    #     k[:, :, :num_k_rope] = apply_rotary_enc_v2(
+    #         k[:, :, :num_k_rope], self.freqs_cis_k, repeat_freqs=rope_k_repeat
+    #     )
+
+    #     dropout_p = self.dropout_p if self.training else 0.0
+    #     # Attention
+    #     try:
+    #         with sdp_kernel_context(dropout_p):
+    #             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+    #     except Exception as e:
+    #         # Fall back to all kernels if the Flash attention kernel fails
+    #         warnings.warn(
+    #             f"Flash Attention kernel failed due to: {e}\nFalling back to all available "
+    #             f"kernels for scaled_dot_product_attention (which may have a slower speed).",
+    #             category=UserWarning,
+    #             stacklevel=2,
+    #         )
+    #         global ALLOW_ALL_KERNELS
+    #         ALLOW_ALL_KERNELS = True
+    #         out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+
+    #     out = self._recombine_heads(out)
+    #     out = self.out_proj(out)
+
+    #     return out

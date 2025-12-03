@@ -318,3 +318,47 @@ class PerceiverResampler(nn.Module):
         latents_2d = self.norm(latents_2d)
 
         return latents_2d, pos_2d
+
+    # def forward_2d(self, x):
+    #     B, C, H, W = x.shape
+
+    #     orig_grid_size = int(math.sqrt(self.num_latents_2d))
+        
+    #     # Check if feature map dimensions match the original latent grid assumption
+    #     if H % orig_grid_size == 0 and W % orig_grid_size == 0:
+    #         # Original logic for standard resolutions (e.g. 1024x1024 input -> 64x64 feat)
+    #         latents_2d = self.latents_2d.unsqueeze(0).expand(B, -1, -1).reshape(-1, 1, C)
+    #         num_window = orig_grid_size
+    #         window_size = H // num_window
+    #     else:
+    #         # Dynamic interpolation for mismatched resolutions (e.g. 448x448 input -> 28x28 feat)
+    #         # Interpolate 16x16 latents to match the 28x28 feature map
+    #         latents_2d = self.latents_2d.reshape(1, orig_grid_size, orig_grid_size, C).permute(0, 3, 1, 2) # (1, C, 16, 16)
+    #         latents_2d = F.interpolate(latents_2d, size=(H, W), mode='bilinear', align_corners=False)
+    #         latents_2d = latents_2d.permute(0, 2, 3, 1).reshape(1, -1, C) # (1, H*W, C)
+            
+    #         # Expand to batch size
+    #         latents_2d = latents_2d.expand(B, -1, -1).reshape(-1, 1, C) # (B, H*W, C) -> logic treats 2nd dim as num_tokens
+            
+    #         # Set windowing parameters for pixel-wise attention
+    #         num_window = H # Assuming square or handled by reshape logic effectively
+    #         window_size = 1
+
+    #     x = x.permute(0, 2, 3, 1)
+
+    #     x = window_partition(x, window_size)
+    #     x = x.flatten(1, 2)
+
+    #     for layer in self.layers:
+    #         latents_2d = layer(latents_2d, x)
+
+    #     latents_2d = latents_2d.view(B, num_window, num_window, C).permute(0, 3, 1, 2)
+
+    #     pos_2d = self.position_encoding(latents_2d)
+    #     pos_2d = pos_2d.permute(0, 2, 3, 1).flatten(1, 2)
+
+    #     latents_2d = latents_2d.permute(0, 2, 3, 1).flatten(1, 2)
+
+    #     latents_2d = self.norm(latents_2d)
+
+    #     return latents_2d, pos_2d
