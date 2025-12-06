@@ -131,7 +131,7 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["num_frames"] = len(inference_state["images"])
 
     @torch.inference_mode()
-    def track_new_frame(self, inference_state, frame_idx, max_history=15):
+    def track_new_frame(self, inference_state, frame_idx, max_history=7):
         """Run tracking on a newly added frame (assuming previous frames are processed)."""
         if not inference_state["tracking_has_started"]:
             self.propagate_in_video_preflight(inference_state)
@@ -185,6 +185,7 @@ class SAM2VideoPredictor(SAM2Base):
             #         obj_output_dict["non_cond_frame_outputs"].pop(
             #             old_frame_idx, None)
 
+            
             # 1. Free raw image memory (RAM)
             # We keep the list slot but set it to None to release the Tensor
             if old_frame_idx < len(inference_state["images"]):
@@ -195,11 +196,12 @@ class SAM2VideoPredictor(SAM2Base):
 
             # 3. Free output masks/logits (VRAM)
             output_dict["non_cond_frame_outputs"].pop(old_frame_idx, None)
+            output_dict["cond_frame_outputs"].pop(old_frame_idx, None)
 
             # 4. Free per-object slices
             for obj_output_dict in inference_state["output_dict_per_obj"].values():
-                obj_output_dict["non_cond_frame_outputs"].pop(
-                    old_frame_idx, None)
+                obj_output_dict["non_cond_frame_outputs"].pop(old_frame_idx, None)
+                obj_output_dict["cond_frame_outputs"].pop(old_frame_idx, None)
 
         # Resize the output mask to the original video resolution
         _, video_res_masks = self._get_orig_video_res_output(
