@@ -1,13 +1,14 @@
+"""
+EdgeTAM Backend Server
+负责摄像头采集、模型推理、视频流推送
+"""
 from sam2.build_sam import build_sam2_video_predictor
-import argparse
 import asyncio
-import json
 import logging
 import os
 import sys
 import time
 import cv2
-import uvicorn
 import threading
 import queue
 import torch
@@ -17,14 +18,16 @@ from fractions import Fraction
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 from av import VideoFrame
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
 # Ensure we can import sam2 from current directory
 sys.path.append(os.getcwd())
 
 # Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("edgetam_webrtc")
+logger = logging.getLogger("edgetam_backend")
 
 # --- Model Configuration & Loading ---
 CHECKPOINT = "checkpoints/edgetam.pt"
@@ -58,7 +61,7 @@ COLORS = [
 
 
 def preprocess_frame_gpu(image_bgr):
-    # Convert BGR (OpenCV) -> RGB
+    """将 BGR 图像预处理为模型输入张量"""
     img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     img_tensor = torch.from_numpy(img_rgb).to(
         DEVICE, non_blocking=True).permute(2, 0, 1).float()
@@ -72,7 +75,7 @@ def preprocess_frame_gpu(image_bgr):
 
 
 def get_mask_overlay(image, masks_tensor, obj_ids, alpha=0.5):
-    # image is BGR
+    """在图像上叠加分割 mask"""
     if isinstance(masks_tensor, torch.Tensor):
         masks_np = masks_tensor.cpu().numpy()
     else:
@@ -100,13 +103,8 @@ def get_mask_overlay(image, masks_tensor, obj_ids, alpha=0.5):
             np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(overlay, contours, -1, bgr, 2)
 
-        # Optimization: Vectorized blending
-        # Only blend where mask is true
+        # Vectorized blending
         roi = overlay[mask_bool]
-        # roi is (N, 3), bgr is (3,)
-        # We want: roi * (1-alpha) + bgr * alpha
-        # Note: cv2.addWeighted is usually faster but requires same size images.
-        # Manual numpy blending on ROI:
         blended = roi.astype(float) * (1 - alpha) + np.array(bgr) * alpha
         overlay[mask_bool] = blended.astype(np.uint8)
 
@@ -114,6 +112,7 @@ def get_mask_overlay(image, masks_tensor, obj_ids, alpha=0.5):
 
 
 def determine_target_obj_id(click_x, click_y, last_masks):
+    """根据点击坐标确定目标对象 ID"""
     if not last_masks:
         return None
     for obj_id in sorted(last_masks.keys(), reverse=True):
@@ -130,14 +129,19 @@ active_track = None
 
 
 class EdgeTAMTrack(MediaStreamTrack):
+    """WebRTC 视频轨道，负责摄像头采集和模型推理"""
     kind = "video"
 
     def __init__(self):
         super().__init__()
+        logger.info("Initializing EdgeTAMTrack...")
         self.frame_queue = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
-        self.start_time = time.time()
-        self.frame_count = 0
+        
+        # FPS 计算（实时）
+        self.last_frame_time = time.time()
+        self.fps = 0.0
+        self.fps_alpha = 0.1  # 平滑系数，用于指数移动平均
 
         # Tracking State
         self.inference_state = None
@@ -146,24 +150,34 @@ class EdgeTAMTrack(MediaStreamTrack):
         self.active_objects = {}
         self.last_masks_cache = {}
         self.click_queue = []
-        self.lock = threading.Lock()  # Protect shared state
+        self.lock = threading.Lock()
 
+        logger.info("Starting camera capture thread...")
         self.capture_thread = threading.Thread(
             target=self._capture_loop, daemon=True)
         self.capture_thread.start()
+        logger.info("EdgeTAMTrack initialized")
 
     def _capture_loop(self):
+        """摄像头采集线程"""
+        logger.info("Attempting to open camera with CAP_DSHOW...")
         cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         if not cap.isOpened():
+            logger.warning("CAP_DSHOW failed, trying default backend...")
             cap = cv2.VideoCapture(0)
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 30)
 
         if not cap.isOpened():
+            logger.error("Failed to open camera")
             return
 
+        actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        logger.info(f"Camera opened successfully: {actual_w}x{actual_h} @ {actual_fps} FPS")
         while not self.stop_event.is_set():
             ret, frame = cap.read()
             if not ret:
@@ -175,12 +189,16 @@ class EdgeTAMTrack(MediaStreamTrack):
                     pass
             self.frame_queue.put(frame)
         cap.release()
+        logger.info("Camera released")
 
     def add_click(self, x, y, label=1):
+        """添加点击事件到队列"""
         with self.lock:
             self.click_queue.append((x, y, label))
+            logger.info(f"Click added: ({x}, {y})")
 
     def reset_state(self):
+        """重置所有跟踪状态"""
         with self.lock:
             self.inference_state = None
             self.is_tracking = False
@@ -188,9 +206,10 @@ class EdgeTAMTrack(MediaStreamTrack):
             self.active_objects = {}
             self.last_masks_cache = {}
             self.click_queue = []
-        logger.info("State Reset")
+        logger.info("Tracking state reset")
 
     async def recv(self):
+        """接收并处理视频帧"""
         pts = int(time.time() * 90000)
         time_base = Fraction(1, 90000)
 
@@ -206,8 +225,6 @@ class EdgeTAMTrack(MediaStreamTrack):
         current_display_masks_tensor = None
         current_display_obj_ids = []
 
-        # Only acquire lock for state updates, try to keep it short
-        # But since predictor state is not thread safe, we effectively single-thread the logic here
         with self.lock:
             # 1. Handle Clicks
             new_clicks_triggered_reinit = False
@@ -218,24 +235,21 @@ class EdgeTAMTrack(MediaStreamTrack):
                     target_obj_id = determine_target_obj_id(
                         cx, cy, self.last_masks_cache)
                     if target_obj_id is None:
-                        if clabel == 1:  # Only support include for now as requested
-                            if self.active_objects:
-                                target_obj_id = max(
-                                    self.active_objects.keys()) + 1
-                            else:
-                                target_obj_id = 0
-                            self.active_objects[target_obj_id] = {
-                                'points': [], 'labels': []}
+                        # 创建新对象
+                        if self.active_objects:
+                            target_obj_id = max(
+                                self.active_objects.keys()) + 1
                         else:
-                            continue
+                            target_obj_id = 0
+                        self.active_objects[target_obj_id] = {
+                            'points': [], 'labels': []}
+                        logger.info(f"New object created: {target_obj_id}")
 
-                    self.active_objects[target_obj_id]['points'].append([
-                                                                        cx, cy])
+                    self.active_objects[target_obj_id]['points'].append([cx, cy])
                     self.active_objects[target_obj_id]['labels'].append(clabel)
                     new_clicks_triggered_reinit = True
 
             # 2. Run Tracking
-            # Preprocess only if needed
             frame_tensor = None
             if self.is_tracking or new_clicks_triggered_reinit:
                 frame_tensor = preprocess_frame_gpu(frame_bgr)
@@ -254,6 +268,7 @@ class EdgeTAMTrack(MediaStreamTrack):
                     )
                     self.is_tracking = True
                     self.frame_idx = 0
+                    logger.info("Inference state initialized")
 
                     temp_masks_list = []
                     temp_ids_list = []
@@ -280,8 +295,7 @@ class EdgeTAMTrack(MediaStreamTrack):
                         masks_np = current_display_masks_tensor.cpu().numpy()
                         for i, oid in enumerate(current_display_obj_ids):
                             if i < len(masks_np):
-                                self.last_masks_cache[oid] = masks_np[i].squeeze(
-                                )
+                                self.last_masks_cache[oid] = masks_np[i].squeeze()
 
             elif self.is_tracking and self.active_objects:
                 predictor.append_frame(self.inference_state, frame_tensor)
@@ -291,10 +305,7 @@ class EdgeTAMTrack(MediaStreamTrack):
                 current_display_masks_tensor = out_masks
                 current_display_obj_ids = self.inference_state["obj_ids"]
 
-                # Update cache for next click
-                # NOTE: Optimization: maybe don't download every frame if we only click occasionally?
-                # But we need masks_np for determine_target_obj_id.
-                # For 30fps, downloading mask (small) is okay.
+                # Update cache
                 self.last_masks_cache = {}
                 if current_display_masks_tensor is not None:
                     masks_np = current_display_masks_tensor.cpu().numpy()
@@ -302,17 +313,22 @@ class EdgeTAMTrack(MediaStreamTrack):
                         if i < len(masks_np):
                             self.last_masks_cache[oid] = masks_np[i].squeeze()
 
-        # 3. Visualize (Draw masks on BGR frame)
+        # 3. Visualize
         display_frame = frame_bgr.copy()
         if current_display_masks_tensor is not None and len(current_display_obj_ids) > 0:
             display_frame = get_mask_overlay(
                 display_frame, current_display_masks_tensor, current_display_obj_ids)
 
-        # FPS
-        self.frame_count += 1
-        elapsed = time.time() - self.start_time
-        fps = self.frame_count / elapsed if elapsed > 0 else 0
-        cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 50),
+        # 计算实时 FPS（基于帧间隔）
+        current_time = time.time()
+        frame_interval = current_time - self.last_frame_time
+        if frame_interval > 0:
+            instant_fps = 1.0 / frame_interval
+            # 使用指数移动平均平滑 FPS
+            self.fps = self.fps_alpha * instant_fps + (1 - self.fps_alpha) * self.fps
+        self.last_frame_time = current_time
+        
+        cv2.putText(display_frame, f"FPS: {self.fps:.1f}", (10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
 
         # WebRTC expects RGB
@@ -324,183 +340,98 @@ class EdgeTAMTrack(MediaStreamTrack):
         return new_frame
 
     def stop(self):
+        """停止视频轨道"""
         self.stop_event.set()
         if self.capture_thread.is_alive():
             self.capture_thread.join(timeout=1.0)
         super().stop()
 
 
-# --- FastAPI ---
+# --- FastAPI Backend ---
 app = FastAPI()
+
+# 添加 CORS 支持，允许前端跨域访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 pcs = set()
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return """
-    <html>
-    <head>
-        <title>EdgeTAM WebRTC</title>
-        <style>
-            body { font-family: sans-serif; text-align: center; background: #f0f0f0; }
-            #video-container { position: relative; display: inline-block; }
-            video { border: 2px solid #333; background: #000; max-width: 100%; }
-            .btn { padding: 10px 20px; font-size: 16px; margin: 10px; cursor: pointer; }
-            .btn-reset { background: #f44336; color: white; border: none; }
-            .btn-start { background: #4CAF50; color: white; border: none; }
-        </style>
-    </head>
-    <body>
-        <h1>EdgeTAM Tracker (30 FPS)</h1>
-        
-        <div id="video-container">
-            <video id="video" autoplay playsinline muted style="width: 1280px; height: 720px;"></video>
-        </div>
-        <br>
-        <button class="btn btn-start" onclick="start()">Start Camera</button>
-        <button class="btn btn-reset" onclick="reset()">Reset (R)</button>
-        <div id="log"></div>
-        
-        <script>
-            var pc = null;
-            
-            function log(msg) { console.log(msg); }
-
-            async function start() {
-                var config = {
-                    sdpSemantics: 'unified-plan',
-                    iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }]
-                };
-
-                if (pc) pc.close();
-                pc = new RTCPeerConnection(config);
-
-                // Explicitly add a transceiver to ensure m-line is generated
-                pc.addTransceiver('video', {direction: 'recvonly'});
-
-                pc.addEventListener('track', function(evt) {
-                    if (evt.track.kind == 'video') {
-                        document.getElementById('video').srcObject = evt.streams[0];
-                    }
-                });
-
-                var offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-
-                // Quick timeout for ICE
-                await new Promise(r => setTimeout(r, 500));
-                
-                var baseUrl = window.location.origin; // Get current host and port
-                
-                var response = await fetch(baseUrl + '/offer', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        sdp: pc.localDescription.sdp,
-                        type: pc.localDescription.type
-                    })
-                });
-                
-                if (!response.ok) {
-                    throw new Error("Server responded with " + response.status);
-                }
-
-                var answer = await response.json();
-                await pc.setRemoteDescription(answer);
-            }
-
-            async function reset() {
-                var baseUrl = window.location.origin;
-                await fetch(baseUrl + '/reset', { method: 'POST' });
-            }
-
-            // Click Handler
-            document.getElementById('video').addEventListener('mousedown', async function(e) {
-                var rect = e.target.getBoundingClientRect();
-                var videoW = 1280;
-                var videoH = 720;
-                
-                if (e.target.naturalWidth > 0) {
-                    videoW = e.target.naturalWidth;
-                    videoH = e.target.naturalHeight;
-                }
-
-                var scaleX = videoW / rect.width;
-                var scaleY = videoH / rect.height;
-                
-                var x = (e.clientX - rect.left) * scaleX;
-                var y = (e.clientY - rect.top) * scaleY;
-                
-                var baseUrl = window.location.origin;
-                await fetch(baseUrl + '/click', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ x: x, y: y, label: 1 })
-                });
-            });
-        </script>
-    </body>
-    </html>
-    """
 
 
 @app.post("/offer")
 async def offer(request: Request):
+    """处理 WebRTC Offer，建立连接"""
     params = await request.json()
-    # Debug: Print received SDP to analyze direction issues
-    print("--- Received SDP Offer ---")
-    print(params["sdp"])
-    print("--------------------------")
+    logger.info("=" * 60)
+    logger.info("Received WebRTC offer from frontend")
+    logger.info(f"SDP type: {params['type']}")
 
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     pc = RTCPeerConnection()
     pcs.add(pc)
+    logger.info(f"Created RTCPeerConnection, total connections: {len(pcs)}")
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
+        logger.info(f"WebRTC Connection state changed: {pc.connectionState}")
         if pc.connectionState == "failed":
+            logger.error("WebRTC connection failed!")
             await pc.close()
             pcs.discard(pc)
 
     global active_track
+    logger.info("Creating EdgeTAMTrack instance...")
     video = EdgeTAMTrack()
-    active_track = video  # Save reference for interaction
+    active_track = video
 
-    # Explicitly add transceiver to avoid direction negotiation issues
+    logger.info("Adding video track to peer connection...")
     pc.addTransceiver(video, direction="sendonly")
-    # pc.addTrack(video) # addTransceiver adds the track implicitly
 
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
 
+    logger.info("WebRTC answer created and set")
+    logger.info("=" * 60)
     return JSONResponse({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
 
 
 @app.post("/click")
 async def click(request: Request):
+    """接收前端点击坐标"""
     params = await request.json()
     x = params.get("x")
     y = params.get("y")
-    if active_track and x is not None:
-        active_track.add_click(x, y, label=1)
+    if active_track and x is not None and y is not None:
+        active_track.add_click(int(x), int(y), label=1)
         return JSONResponse({"status": "ok"})
-    return JSONResponse({"status": "error"})
+    return JSONResponse({"status": "error", "message": "Invalid click data"})
 
 
 @app.post("/reset")
 async def reset_handler(request: Request):
+    """重置跟踪状态"""
     if active_track:
         active_track.reset_state()
-    return JSONResponse({"status": "reset"})
+        logger.info("Reset request received")
+        return JSONResponse({"status": "reset"})
+    return JSONResponse({"status": "error", "message": "No active track"})
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    """关闭所有连接"""
     coros = [pc.close() for pc in pcs]
     await asyncio.gather(*coros)
     pcs.clear()
+    logger.info("Server shutdown")
+
 
 if __name__ == "__main__":
+    logger.info("Starting EdgeTAM Backend Server on http://0.0.0.0:7860")
     uvicorn.run(app, host="0.0.0.0", port=7860)
